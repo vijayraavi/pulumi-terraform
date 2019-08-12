@@ -248,6 +248,7 @@ type resourceType struct {
 	schema     *schema.Resource
 	info       *tfbridge.ResourceInfo
 	docURL     string
+	parsedDocs parsedDoc // parsed docs.
 }
 
 func (rt *resourceType) Name() string { return rt.name }
@@ -256,17 +257,18 @@ func (rt *resourceType) Doc() string  { return rt.doc }
 // IsProvider is true if this resource is a ProviderResource.
 func (rt *resourceType) IsProvider() bool { return rt.isProvider }
 
-func newResourceType(name, doc, docURL string, schema *schema.Resource, info *tfbridge.ResourceInfo,
+func newResourceType(name string, parsedDocs parsedDoc, schema *schema.Resource, info *tfbridge.ResourceInfo,
 	isProvider bool) *resourceType {
 
 	return &resourceType{
 		name:       name,
-		doc:        doc,
+		doc:        parsedDocs.Description,
 		isProvider: isProvider,
 		schema:     schema,
 		info:       info,
 		reqprops:   make(map[string]bool),
-		docURL:     docURL,
+		docURL:     parsedDocs.URL,
+		parsedDocs: parsedDocs,
 	}
 }
 
@@ -564,7 +566,7 @@ func (g *generator) gatherResource(rawname string,
 	}
 
 	// Create an empty module and associated resource type.
-	res := newResourceType(name, parsedDocs.Description, parsedDocs.URL, schema, info, isProvider)
+	res := newResourceType(name, parsedDocs, schema, info, isProvider)
 
 	args := tfbridge.CleanTerraformSchema(schema.Schema)
 
