@@ -15,13 +15,9 @@
 package tfgen
 
 import (
-	"bytes"
 	"fmt"
 	"io/ioutil"
-	"os"
-	"os/exec"
 	"path"
-	"path/filepath"
 	"regexp"
 	"sort"
 	"strings"
@@ -536,45 +532,7 @@ var errTF2PulumiMissing = errors.New("tf2pulumi is missing, please install it an
 // convertHCL converts an in-memory, simple HCL program to Pulumi, and returns it as a string. In the event
 // of failure, the error returned will be non-nil, and the second string contains the stderr stream of details.
 func convertHCL(hcl string) (string, string, error) {
-	// First, see if tf2pulumi is on the PATH, or not.
-	path, err := exec.LookPath("tf2pulumi")
-	if err != nil {
-		return "", "", errTF2PulumiMissing
-	}
-
-	// Now create a temp dir and spill the HCL into it. Terraform's module loader assumes code is in a file.
-	dir, err := ioutil.TempDir("", "pt-hcl-")
-	if err != nil {
-		return "", "", errors.Wrap(err, "creating temp HCL dir")
-	}
-	defer os.RemoveAll(dir)
-
-	// fixup the HCL as necessary.
-	if fixed, ok := fixHcl(hcl); ok {
-		hcl = fixed
-	}
-
-	file := filepath.Join(dir, "main.tf")
-	if err = ioutil.WriteFile(file, []byte(hcl), 0644); err != nil {
-		return "", "", errors.Wrap(err, "writing temp HCL file")
-	}
-
-	// Now run the tf2pulumi command, streaming the results into a string. This explicitly does not use
-	// tf2pulumi in library form because it greatly complicates our modules/vendoring story.
-	stdout := &bytes.Buffer{}
-	stderr := &bytes.Buffer{}
-
-	args := []string{"--allow-missing-variables", "--filter-auto-names"}
-
-	tf2pulumi := exec.Command(path, args...)
-	tf2pulumi.Dir = dir
-	tf2pulumi.Stdout = stdout
-	tf2pulumi.Stderr = stderr
-	if err = tf2pulumi.Run(); err != nil {
-		return "", stderr.String(), errors.Wrap(err, "converting HCL to Pulumi code")
-	}
-
-	return stdout.String(), "", nil
+	return "", "", errors.New("ignore")
 }
 
 func cleanupDoc(g *generator, info tfbridge.ResourceOrDataSourceInfo, doc parsedDoc) parsedDoc {
