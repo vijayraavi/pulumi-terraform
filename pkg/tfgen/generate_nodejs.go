@@ -64,14 +64,14 @@ type nodeJSGenerator struct {
 // TODO JVP document
 type nestedTypes struct {
 	inputs        map[string]string
-	inputOverlays map[string]string
+	inputOverlays importMap
 	outputs       map[string]string
 }
 
 func newNestedTypes() *nestedTypes {
 	return &nestedTypes{
 		inputs:        make(map[string]string),
-		inputOverlays: make(map[string]string),
+		inputOverlays: make(importMap),
 		outputs:       make(map[string]string),
 	}
 }
@@ -644,10 +644,15 @@ func (g *nodeJSGenerator) emitResourceType(mod *module, res *resourceType, neste
 	for _, fldinfo := range res.info.Fields {
 		fldinfos = append(fldinfos, fldinfo)
 	}
-	if err = g.emitCustomImports(w, mod, fldinfos); err != nil {
+	imports := make(importMap)
+	for _, info := range fldinfos {
+		if err := g.gatherCustomImports(mod, info, imports); err != nil {
+			return "", err
+		}
+	}
+	if err = g.emitImportMap(w, imports); err != nil {
 		return "", err
 	}
-	// TODO JVP, add custom imports to nested.inputOverlays
 
 	// Write the TypeDoc/JSDoc for the resource class
 	if res.doc != "" {
@@ -1172,7 +1177,12 @@ func (g *nodeJSGenerator) emitCustomImports(w *tools.GenWriter, mod *module, inf
 		}
 	}
 
-	// Next, if there were any imports, generate the import statement.  We must sort names to ensure determinism.
+	// Next, if there were any imports, generate the import statement.
+	return g.emitImportMap(w, imports)
+}
+
+// TODO JVP docs
+func (g *nodeJSGenerator) emitImportMap(w *tools.GenWriter, imports importMap) error {
 	if len(imports) > 0 {
 		var files []string
 		for file := range imports {
@@ -1181,6 +1191,7 @@ func (g *nodeJSGenerator) emitCustomImports(w *tools.GenWriter, mod *module, inf
 		sort.Strings(files)
 
 		for _, file := range files {
+			// We must sort names to ensure determinism.
 			var names []string
 			for name := range imports[file] {
 				names = append(names, name)
