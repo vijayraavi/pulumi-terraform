@@ -100,8 +100,8 @@ func (g *nodeJSGenerator) relativeRootDir(mod *module) string {
 }
 
 // openWriter opens a writer for the given module and file name, emitting the standard header automatically.
-func (g *nodeJSGenerator) openWriter(mod *module, name string, needsSDK, needsUtilities bool) (*tools.GenWriter, string,
-	error) {
+func (g *nodeJSGenerator) openWriter(mod *module, name string, needsSDK, needsInputOutput,
+	needsUtilities bool) (*tools.GenWriter, string, error) {
 
 	dir := g.moduleDir(mod)
 	file := filepath.Join(dir, name)
@@ -115,16 +115,18 @@ func (g *nodeJSGenerator) openWriter(mod *module, name string, needsSDK, needsUt
 
 	// If needed, emit the standard Pulumi SDK import statement.
 	if needsSDK {
-		g.emitSDKImport(mod, w, needsUtilities)
+		g.emitSDKImport(mod, w, needsInputOutput, needsUtilities)
 	}
 
 	return w, file, nil
 }
 
-func (g *nodeJSGenerator) emitSDKImport(mod *module, w *tools.GenWriter, needsUtilities bool) {
+func (g *nodeJSGenerator) emitSDKImport(mod *module, w *tools.GenWriter, needsInputOutput, needsUtilities bool) {
 	w.Writefmtln("import * as pulumi from \"@pulumi/pulumi\";")
-	w.Writefmtln("import * as inputApi from \"%s/types/input\";", g.relativeRootDir(mod))
-	w.Writefmtln("import * as outputApi from \"%s/types/output\";", g.relativeRootDir(mod))
+	if needsInputOutput {
+		w.Writefmtln("import * as inputApi from \"%s/types/input\";", g.relativeRootDir(mod))
+		w.Writefmtln("import * as outputApi from \"%s/types/output\";", g.relativeRootDir(mod))
+	}
 	if needsUtilities {
 		w.Writefmtln("import * as utilities from \"%s/utilities\";", g.relativeRootDir(mod))
 	}
@@ -142,6 +144,22 @@ func (g *nodeJSGenerator) emitPackage(pack *pkg) error {
 	// Create a map of modules to *nestedTypes.
 	nestedMap := make(map[string]*nestedTypes)
 
+	err := g.emitPackageComplex(pack, nestedMap)
+	if err != nil {
+		return err
+	}
+
+	// If we didn't emit any nested types, re-emit the package without the types module or inputApi/outputApi exports.
+	if len(nestedMap) == 0 {
+		return g.emitPackageComplex(pack, nil)
+	}
+
+	return nil
+}
+
+func (g *nodeJSGenerator) emitPackageComplex(pack *pkg, nestedMap map[string]*nestedTypes) error {
+	emitNested := nestedMap != nil
+
 	// Generate the individual modules and their contents.
 	files, submodules, err := g.emitModules(pack.modules, nestedMap)
 	if err != nil {
@@ -155,11 +173,11 @@ func (g *nodeJSGenerator) emitPackage(pack *pkg) error {
 	}
 
 	// Generate initial top-level module without `types` submodule.
-	_, _, nested, err := g.emitModule(index, submodules)
+	_, _, nested, err := g.emitModule(index, submodules, emitNested)
 	if err != nil {
 		return err
 	}
-	if nested != nil {
+	if nestedMap != nil && nested != nil {
 		nestedMap[""] = nested
 	}
 
@@ -191,7 +209,7 @@ func (g *nodeJSGenerator) emitPackage(pack *pkg) error {
 
 		// Regenerate the top-level index again, this time including the `types` submodule since we have some types.
 		submodules["types"] = typesIndex
-		indexFiles, _, _, err := g.emitModule(index, submodules)
+		indexFiles, _, _, err := g.emitModule(index, submodules, emitNested)
 		if err != nil {
 			return err
 		}
@@ -263,7 +281,8 @@ func (g *nodeJSGenerator) emitNestedTypes(nestedMap map[string]*nestedTypes, inp
 	}
 
 	// Open the file for writing.
-	w, file, err := g.openWriter(typesMod, name+".ts", true /**needsSDK*/, false /*needsUtilities*/)
+	w, file, err := g.openWriter(typesMod, name+".ts",
+		true /**needsSDK*/, true /*needsInputOutput*/, false /*needsUtilities*/)
 	if err != nil {
 		return "", err
 	}
@@ -354,19 +373,21 @@ func (g *nodeJSGenerator) emitNestedTypes(nestedMap map[string]*nestedTypes, inp
 func (g *nodeJSGenerator) emitModules(mmap moduleMap, nestedMap map[string]*nestedTypes) ([]string, map[string]string,
 	error) {
 
+	emitNested := nestedMap != nil
+
 	var allFiles []string
 	moduleMap := make(map[string]string)
 	for _, mod := range mmap.values() {
 		if mod.name == "" {
 			continue // skip the root module, it is handled specially.
 		}
-		files, index, nested, err := g.emitModule(mod, nil)
+		files, index, nested, err := g.emitModule(mod, nil, emitNested)
 		if err != nil {
 			return nil, nil, err
 		}
 		allFiles = append(allFiles, files...)
 		moduleMap[mod.name] = index
-		if nested != nil {
+		if nestedMap != nil && nested != nil {
 			nestedMap[mod.name] = nested
 		}
 	}
@@ -389,7 +410,9 @@ func (g *nodeJSGenerator) emitModules(mmap moduleMap, nestedMap map[string]*nest
 // Note that the special module "" represents the top-most package module and won't be placed in a sub-directory.
 //
 // The return values are the full list of files generated, the index file, and any error that occurred, respectively.
-func (g *nodeJSGenerator) emitModule(mod *module, submods map[string]string) ([]string, string, *nestedTypes, error) {
+func (g *nodeJSGenerator) emitModule(mod *module, submods map[string]string, emitNested bool) ([]string, string,
+	*nestedTypes, error) {
+
 	glog.V(3).Infof("emitModule(%s)", mod.name)
 
 	// Ensure that the target module directory exists.
@@ -409,7 +432,7 @@ func (g *nodeJSGenerator) emitModule(mod *module, submods map[string]string) ([]
 	// Now, enumerate each module member, in the order presented to us, and do the right thing.
 	var files []string
 	for _, member := range mod.members {
-		file, err := g.emitModuleMember(mod, member, nested)
+		file, err := g.emitModuleMember(mod, member, nested, emitNested)
 		if err != nil {
 			return nil, "", nil, errors.Wrapf(err, "emitting module %s member %s", mod.name, member.Name())
 		} else if file != "" {
@@ -543,14 +566,16 @@ func (g *nodeJSGenerator) emitUtilities(mod *module) (string, error) {
 }
 
 // emitModuleMember emits the given member, and returns the module file that it was emitted into (if any).
-func (g *nodeJSGenerator) emitModuleMember(mod *module, member moduleMember, nested *nestedTypes) (string, error) {
+func (g *nodeJSGenerator) emitModuleMember(mod *module, member moduleMember, nested *nestedTypes,
+	emitNested bool) (string, error) {
+
 	glog.V(3).Infof("emitModuleMember(%s, %s)", mod, member.Name())
 
 	switch t := member.(type) {
 	case *resourceType:
-		return g.emitResourceType(mod, t, nested)
+		return g.emitResourceType(mod, t, nested, emitNested)
 	case *resourceFunc:
-		return g.emitResourceFunc(mod, t, nested)
+		return g.emitResourceFunc(mod, t, nested, emitNested)
 	case *variable:
 		contract.Assertf(mod.config(),
 			"only expected top-level variables in config module (%s is not one)", mod.name)
@@ -708,7 +733,9 @@ func (g *nodeJSGenerator) emitPlainOldType(w *tools.GenWriter, pot *plainOldType
 }
 
 //nolint:lll
-func (g *nodeJSGenerator) emitResourceType(mod *module, res *resourceType, nested *nestedTypes) (string, error) {
+func (g *nodeJSGenerator) emitResourceType(mod *module, res *resourceType, nested *nestedTypes,
+	emitNested bool) (string, error) {
+
 	// Create a resource module file into which all of this resource's types will go.
 	name := res.name
 	filename := lowerFirst(name)
@@ -970,7 +997,9 @@ func (g *nodeJSGenerator) writeAlias(w *tools.GenWriter, alias tfbridge.AliasInf
 	w.WriteString(" }")
 }
 
-func (g *nodeJSGenerator) emitResourceFunc(mod *module, fun *resourceFunc, nested *nestedTypes) (string, error) {
+func (g *nodeJSGenerator) emitResourceFunc(mod *module, fun *resourceFunc, nested *nestedTypes,
+	emitNested bool) (string, error) {
+
 	// Create a vars.ts file into which all configuration variables will go.
 	w, file, err := g.openWriter(mod, fun.name+".ts", true, true)
 	if err != nil {
