@@ -154,11 +154,20 @@ func (g *nodeJSGenerator) emitPackage(pack *pkg) error {
 		index.members = append(index.members, pack.provider)
 	}
 
-	// Generate initial top-level module without `types` submodule.
-	_, _, nested, err := g.emitModule(index, submodules)
+	// Add a types module.
+	typesIndex, err := g.emitTypesModule()
 	if err != nil {
 		return err
 	}
+	files = append(files, typesIndex)
+	submodules["types"] = typesIndex
+
+	// Generate initial top-level module without `types` submodule.
+	indexFiles, _, nested, err := g.emitModule(index, submodules)
+	if err != nil {
+		return err
+	}
+	files = append(files, indexFiles...)
 	if nested != nil {
 		nestedMap[""] = nested
 	}
@@ -168,35 +177,13 @@ func (g *nodeJSGenerator) emitPackage(pack *pkg) error {
 	if err != nil {
 		return err
 	}
-	if typesInputFile != "" {
-		files = append(files, typesInputFile)
-	}
+	files = append(files, typesInputFile)
 
 	typesOutputFile, err := g.emitNestedTypes(nestedMap, false /*input*/)
 	if err != nil {
 		return err
 	}
-	if typesOutputFile != "" {
-		files = append(files, typesOutputFile)
-	}
-
-	hasInputs := typesInputFile != ""
-	hasOutputs := typesOutputFile != ""
-	typesIndex, err := g.emitTypesModule(hasInputs, hasOutputs)
-	if err != nil {
-		return err
-	}
-	if typesIndex != "" {
-		files = append(files, typesIndex)
-
-		// Regenerate the top-level index again, this time including the `types` submodule since we have some types.
-		submodules["types"] = typesIndex
-		indexFiles, _, _, err := g.emitModule(index, submodules)
-		if err != nil {
-			return err
-		}
-		files = append(files, indexFiles...)
-	}
+	files = append(files, typesOutputFile)
 
 	// Finally emit the package metadata (NPM, TypeScript, and so on).
 	sort.Strings(files)
@@ -204,23 +191,20 @@ func (g *nodeJSGenerator) emitPackage(pack *pkg) error {
 }
 
 // emitTypesModule emits the `types` module.
-func (g *nodeJSGenerator) emitTypesModule(hasInputs, hasOutputs bool) (string, error) {
-	if !hasInputs && !hasOutputs {
-		return "", nil
-	}
-
+func (g *nodeJSGenerator) emitTypesModule() (string, error) {
 	typesMod := newModule("types")
 	dir := g.moduleDir(typesMod)
 
-	submodules := make(map[string]string)
-	if hasInputs {
-		submodules["input"] = path.Join(dir, "input.ts")
-	}
-	if hasOutputs {
-		submodules["output"] = path.Join(dir, "output.ts")
+	// Ensure the types directory exists.
+	if err := tools.EnsureDir(dir); err != nil {
+		return "", errors.Wrapf(err, "creating module directory")
 	}
 
-	typesIndexFile, err := g.emitIndex(typesMod, nil, submodules)
+	// Emit the index.
+	typesIndexFile, err := g.emitIndex(typesMod, nil, map[string]string{
+		"input":  path.Join(dir, "input.ts"),
+		"output": path.Join(dir, "output.ts"),
+	})
 	if err != nil {
 		return "", err
 	}
@@ -230,37 +214,12 @@ func (g *nodeJSGenerator) emitTypesModule(hasInputs, hasOutputs bool) (string, e
 // emitNestedTypes emits the nested types in the map of modules to nestedTypes in either a `types/input.ts` or
 // `types/output.ts` based on the value of `input`.
 func (g *nodeJSGenerator) emitNestedTypes(nestedMap map[string]*nestedTypes, input bool) (string, error) {
-	// Ensure we have nested types.
-	if nestedMap == nil {
-		return "", nil
-	}
-	any := false
-	for _, nested := range nestedMap {
-		typeMap := nested.outputs
-		if input {
-			typeMap = nested.inputs
-		}
-		if len(typeMap) > 0 {
-			any = true
-			break
-		}
-	}
-	if !any {
-		return "", nil
-	}
-
 	name := "output"
 	if input {
 		name = "input"
 	}
 
 	typesMod := newModule("types")
-
-	// Ensure the types directory exists.
-	dir := g.moduleDir(typesMod)
-	if err := tools.EnsureDir(dir); err != nil {
-		return "", errors.Wrapf(err, "creating module directory")
-	}
 
 	// Open the file for writing.
 	w, file, err := g.openWriter(typesMod, name+".ts", true /**needsSDK*/, false /*needsUtilities*/)
