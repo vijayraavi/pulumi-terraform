@@ -274,16 +274,17 @@ func newResourceType(name string, parsedDocs parsedDoc, schema *schema.Resource,
 
 // resourceFunc is a generated resource function that is exposed to interact with Pulumi objects.
 type resourceFunc struct {
-	name    string
-	doc     string
-	args    []*variable
-	rets    []*variable
-	reqargs map[string]bool
-	argst   *plainOldType
-	retst   *plainOldType
-	schema  *schema.Resource
-	info    *tfbridge.DataSourceInfo
-	docURL  string
+	name       string
+	doc        string
+	args       []*variable
+	rets       []*variable
+	reqargs    map[string]bool
+	argst      *plainOldType
+	retst      *plainOldType
+	schema     *schema.Resource
+	info       *tfbridge.DataSourceInfo
+	docURL     string
+	parsedDocs parsedDoc
 }
 
 func (rf *resourceFunc) Name() string { return rf.name }
@@ -710,12 +711,13 @@ func (g *generator) gatherDataSource(rawname string,
 
 	// Build up the function information.
 	fun := &resourceFunc{
-		name:    name,
-		doc:     parsedDocs.Description,
-		reqargs: make(map[string]bool),
-		schema:  ds,
-		info:    info,
-		docURL:  parsedDocs.URL,
+		name:       name,
+		doc:        parsedDocs.Description,
+		reqargs:    make(map[string]bool),
+		schema:     ds,
+		info:       info,
+		docURL:     parsedDocs.URL,
+		parsedDocs: parsedDocs,
 	}
 
 	// Sort the args and return properties so we are ready to go.

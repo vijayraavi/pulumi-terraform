@@ -60,6 +60,21 @@ type nodeJSGenerator struct {
 	outDir      string
 }
 
+// TODO JVP document
+type nestedTypes struct {
+	inputs        map[string]string
+	inputOverlays map[string]string
+	outputs       map[string]string
+}
+
+func makeNestedTypes() *nestedTypes {
+	return &nestedTypes{
+		inputs:        make(map[string]string),
+		inputOverlays: make(map[string]string),
+		outputs:       make(map[string]string),
+	}
+}
+
 // commentChars returns the comment characters to use for single-line comments.
 func (g *nodeJSGenerator) commentChars() string {
 	return "//"
@@ -117,40 +132,12 @@ func (g *nodeJSGenerator) emitPackage(pack *pkg) error {
 		return errors.New("This provider has a `types` module which is reserved for input/output types")
 	}
 
+	nestedMap := make(map[string]*nestedTypes)
+
 	// Generate the individual modules and their contents.
-	files, submodules, inputSubmodules, outputSubmodules, err := g.emitModules(pack.modules)
+	files, submodules, err := g.emitModules(pack.modules, nestedMap)
 	if err != nil {
 		return err
-	}
-
-	// Generate index for `types` module that exports the `input` and `output` submodules, if they're present.
-	typesSubmodules := make(map[string]string)
-	if len(inputSubmodules) > 0 {
-		inputMod := newModule(filepath.Join("types", "input"))
-		inputIndex, err := g.emitIndex(inputMod, nil, inputSubmodules)
-		if err != nil {
-			return err
-		}
-		files = append(files, inputIndex)
-		typesSubmodules["input"] = inputIndex
-	}
-	if len(outputSubmodules) > 0 {
-		outputMod := newModule(filepath.Join("types", "output"))
-		outputIndex, err := g.emitIndex(outputMod, nil, outputSubmodules)
-		if err != nil {
-			return err
-		}
-		files = append(files, outputIndex)
-		typesSubmodules["output"] = outputIndex
-	}
-	if len(inputSubmodules) > 0 || len(outputSubmodules) > 0 {
-		typesMod := newModule("types")
-		typesIndex, err := g.emitIndex(typesMod, nil, typesSubmodules)
-		if err != nil {
-			return err
-		}
-		files = append(files, typesIndex)
-		submodules["types"] = typesIndex
 	}
 
 	// Generate a top-level index file that re-exports any child modules and a top-level utils file.
@@ -159,13 +146,23 @@ func (g *nodeJSGenerator) emitPackage(pack *pkg) error {
 		index.members = append(index.members, pack.provider)
 	}
 
-	modFiles, inputFiles, outputFiles, err := g.emitModule(index, submodules, inputSubmodules, outputSubmodules)
+	indexFiles, _, nested, err := g.emitModule(index, submodules)
 	if err != nil {
 		return err
 	}
-	files = append(files, modFiles.files...)
-	files = append(files, inputFiles.files...)
-	files = append(files, outputFiles.files...)
+	files = append(files, indexFiles...)
+	nestedMap[""] = nested
+
+	// TODO JVP Emit the inputs and outputs
+	// TODO JVP Emit the types index
+	for mod, nested := range nestedMap {
+		for typ := range nested.inputs {
+			fmt.Printf("%s: %s: %s\n", "input", mod, typ)
+		}
+		for typ := range nested.outputs {
+			fmt.Printf("%s: %s: %s\n", "output", mod, typ)
+		}
+	}
 
 	// Finally emit the package metadata (NPM, TypeScript, and so on).
 	sort.Strings(files)
@@ -174,49 +171,30 @@ func (g *nodeJSGenerator) emitPackage(pack *pkg) error {
 
 // emitModules emits all modules in the given module map.  It returns a full list of files, a map of module to its
 // associated index, and any error that occurred, if any.
-func (g *nodeJSGenerator) emitModules(mmap moduleMap) ([]string, map[string]string, map[string]string,
-	map[string]string, error) {
+func (g *nodeJSGenerator) emitModules(mmap moduleMap, nestedMap map[string]*nestedTypes) ([]string, map[string]string,
+	error) {
 
 	var allFiles []string
 	moduleMap := make(map[string]string)
-	inputMap := make(map[string]string)
-	outputMap := make(map[string]string)
 	for _, mod := range mmap.values() {
 		if mod.name == "" {
 			continue // skip the root module, it is handled specially.
 		}
 
-		modFiles, inputFiles, outputFiles, err := g.emitModule(mod, nil, nil, nil)
+		files, index, nested, err := g.emitModule(mod, nil)
 		if err != nil {
-			return nil, nil, nil, nil, err
+			return nil, nil, err
 		}
-
-		allFiles = append(allFiles, modFiles.files...)
-		if modFiles.index != "" {
-			moduleMap[mod.name] = modFiles.index
-		}
-
-		allFiles = append(allFiles, inputFiles.files...)
-		if inputFiles.index != "" {
-			inputMap[mod.name] = inputFiles.index
-		}
-
-		allFiles = append(allFiles, outputFiles.files...)
-		if outputFiles.index != "" {
-			outputMap[mod.name] = outputFiles.index
-		}
+		allFiles = append(allFiles, files...)
+		moduleMap[mod.name] = index
+		nestedMap[mod.name] = nested
 	}
-	return allFiles, moduleMap, inputMap, outputMap, nil
+	return allFiles, moduleMap, nil
 }
 
-type moduleFiles struct {
-	index string   // Index file.
-	files []string // Full list of files generated.
-}
-
-// emitModule emits a module.  This module ends up having many possible ES6 sub-modules which are then re-exported at
-// the top level.  This is to make it convenient for overlays to import files within the same module without causing
-// problematic cycles.  For example, imagine a module m with many members; the result is:
+// emitModule emits a module.  This module ends up having many possible ES6 sub-modules which are then re-exported
+// at the top level.  This is to make it convenient for overlays to import files within the same module without
+// causing problematic cycles.  For example, imagine a module m with many members; the result is:
 //
 //     m/
 //         README.md
@@ -229,42 +207,32 @@ type moduleFiles struct {
 //
 // Note that the special module "" represents the top-most package module and won't be placed in a sub-directory.
 //
-// The return values are the modFiles (index file and full list of files generated) for the module and its associated
-// inputs and outputs modules, and any error that occurred, respectively.
-func (g *nodeJSGenerator) emitModule(mod *module, submods map[string]string, inputSubmods map[string]string,
-	outputSubmods map[string]string) (moduleFiles, moduleFiles, moduleFiles, error) {
-
+// The return values are the full list of files generated, the index file, and any error that occurred, respectively.
+func (g *nodeJSGenerator) emitModule(mod *module, submods map[string]string) ([]string, string, *nestedTypes, error) {
 	glog.V(3).Infof("emitModule(%s)", mod.name)
 
 	// Ensure that the target module directory exists.
 	dir := g.moduleDir(mod)
 	if err := tools.EnsureDir(dir); err != nil {
-		return moduleFiles{}, moduleFiles{}, moduleFiles{}, errors.Wrapf(err, "creating module directory")
+		return nil, "", nil, errors.Wrapf(err, "creating module directory")
 	}
 
 	// Ensure that the target module directory contains a README.md file.
 	if err := g.ensureReadme(dir); err != nil {
-		return moduleFiles{}, moduleFiles{}, moduleFiles{}, errors.Wrapf(err, "creating module README file")
+		return nil, "", nil, errors.Wrapf(err, "creating module README file")
 	}
+
+	// Create the data structure to hold nested type details for the module.
+	nested := makeNestedTypes()
 
 	// Now, enumerate each module member, in the order presented to us, and do the right thing.
 	var files []string
-	var inputFiles []string
-	var outputFiles []string
 	for _, member := range mod.members {
-		file, inputFile, outputFile, err := g.emitModuleMember(mod, member)
+		file, err := g.emitModuleMember(mod, member, nested)
 		if err != nil {
-			return moduleFiles{}, moduleFiles{}, moduleFiles{},
-				errors.Wrapf(err, "emitting module %s member %s", mod.name, member.Name())
-		}
-		if file != "" {
+			return nil, "", nil, errors.Wrapf(err, "emitting module %s member %s", mod.name, member.Name())
+		} else if file != "" {
 			files = append(files, file)
-		}
-		if inputFile != "" {
-			inputFiles = append(inputFiles, inputFile)
-		}
-		if outputFile != "" {
-			outputFiles = append(outputFiles, outputFile)
 		}
 	}
 
@@ -272,7 +240,7 @@ func (g *nodeJSGenerator) emitModule(mod *module, submods map[string]string, inp
 	if mod.config() {
 		file, err := g.emitConfigVariables(mod)
 		if err != nil {
-			return moduleFiles{}, moduleFiles{}, moduleFiles{}, errors.Wrapf(err, "emitting config module variables")
+			return nil, "", nil, errors.Wrapf(err, "emitting config module variables")
 		}
 		files = append(files, file)
 	}
@@ -280,45 +248,21 @@ func (g *nodeJSGenerator) emitModule(mod *module, submods map[string]string, inp
 	// Generate an index file for this module.
 	index, err := g.emitIndex(mod, files, submods)
 	if err != nil {
-		return moduleFiles{}, moduleFiles{}, moduleFiles{}, errors.Wrapf(err, "emitting module %s index", mod.name)
+		return nil, "", nil, errors.Wrapf(err, "emitting module %s index", mod.name)
 	}
 	files = append(files, index)
-
-	// Generate an index file for this module's inputs.
-	inputIndex := ""
-	if len(inputFiles) > 0 {
-		inputMod := newModule(filepath.Join("types", "input", mod.name))
-		inputIndex, err = g.emitIndex(inputMod, inputFiles, inputSubmods)
-		if err != nil {
-			return moduleFiles{}, moduleFiles{}, moduleFiles{},
-				errors.Wrapf(err, "emitting module %s index", inputMod.name)
-		}
-	}
-
-	// Generate an index file for this module's outputs.
-	outputIndex := ""
-	if len(outputFiles) > 0 {
-		outputMod := newModule(filepath.Join("types", "output", mod.name))
-		outputIndex, err = g.emitIndex(outputMod, outputFiles, outputSubmods)
-		if err != nil {
-			return moduleFiles{}, moduleFiles{}, moduleFiles{},
-				errors.Wrapf(err, "emitting module %s index", outputMod.name)
-		}
-	}
 
 	// Lastly, if this is the root module, we need to emit a file containing utility functions consumed by other
 	// modules.
 	if mod.root() {
 		utils, err := g.emitUtilities(mod)
 		if err != nil {
-			return moduleFiles{}, moduleFiles{}, moduleFiles{},
-				errors.Wrapf(err, "emitting utility file for root module")
+			return nil, "", nil, errors.Wrapf(err, "emitting utility file for root module")
 		}
 		files = append(files, utils)
 	}
 
-	return moduleFiles{index: index, files: files}, moduleFiles{index: inputIndex, files: inputFiles},
-		moduleFiles{index: outputIndex, files: outputFiles}, nil
+	return files, index, nested, nil
 }
 
 // ensureReadme writes out a stock README.md file, provided one doesn't already exist.
@@ -413,26 +357,25 @@ func (g *nodeJSGenerator) emitUtilities(mod *module) (string, error) {
 	return utilities, nil
 }
 
-// emitModuleMember emits the given member, and returns the module, input, and output files.
-func (g *nodeJSGenerator) emitModuleMember(mod *module, member moduleMember) (string, string, string, error) {
+// emitModuleMember emits the given member, and returns the module file.
+func (g *nodeJSGenerator) emitModuleMember(mod *module, member moduleMember, nested *nestedTypes) (string, error) {
 	glog.V(3).Infof("emitModuleMember(%s, %s)", mod, member.Name())
 
 	switch t := member.(type) {
 	case *resourceType:
-		return g.emitResourceType(mod, t)
+		return g.emitResourceType(mod, t, nested)
 	case *resourceFunc:
-		return g.emitResourceFunc(mod, t)
+		return g.emitResourceFunc(mod, t, nested)
 	case *variable:
 		contract.Assertf(mod.config(),
 			"only expected top-level variables in config module (%s is not one)", mod.name)
 		// skip the variable, we will process it later.
-		return "", "", "", nil
+		return "", nil
 	case *overlayFile:
-		file, err := g.emitOverlay(mod, t)
-		return file, "", "", err
+		return g.emitOverlay(mod, t)
 	default:
 		contract.Failf("unexpected member type: %v", reflect.TypeOf(member))
-		return "", "", "", nil
+		return "", nil
 	}
 }
 
@@ -579,7 +522,7 @@ func (g *nodeJSGenerator) emitPlainOldType(w *tools.GenWriter, pot *plainOldType
 }
 
 //nolint:lll
-func (g *nodeJSGenerator) emitResourceType(mod *module, res *resourceType) (string, string, string, error) {
+func (g *nodeJSGenerator) emitResourceType(mod *module, res *resourceType, nested *nestedTypes) (string, error) {
 	// Create a resource module file into which all of this resource's types will go.
 	name := res.name
 	filename := lowerFirst(name)
@@ -593,7 +536,7 @@ func (g *nodeJSGenerator) emitResourceType(mod *module, res *resourceType) (stri
 
 	w, file, err := g.openWriter(mod, filename+".ts", true)
 	if err != nil {
-		return "", "", "", err
+		return "", err
 	}
 	defer contract.IgnoreClose(w)
 
@@ -603,8 +546,9 @@ func (g *nodeJSGenerator) emitResourceType(mod *module, res *resourceType) (stri
 		fldinfos = append(fldinfos, fldinfo)
 	}
 	if err = g.emitCustomImports(w, mod, fldinfos); err != nil {
-		return "", "", "", err
+		return "", err
 	}
+	// TODO JVP, add custom imports to nested.inputOverlays
 
 	// Write the TypeDoc/JSDoc for the resource class
 	if res.doc != "" {
@@ -658,9 +602,6 @@ func (g *nodeJSGenerator) emitResourceType(mod *module, res *resourceType) (stri
 	w.Writefmtln("    }")
 	w.Writefmtln("")
 
-	nestedInputTypes := make(map[string]string)
-	nestedOutputTypes := make(map[string]string)
-
 	// Emit all properties (using their output types).
 	// TODO[pulumi/pulumi#397]: represent sensitive types using a Secret<T> type.
 	ins := make(map[string]bool)
@@ -681,7 +622,7 @@ func (g *nodeJSGenerator) emitResourceType(mod *module, res *resourceType) (stri
 		}
 
 		w.Writefmtln("    public %sreadonly %s!: pulumi.Output<%s>;",
-			outcomment, prop.name, tsType(mod.name, name, prop, res.parsedDocs, nestedOutputTypes,
+			outcomment, prop.name, tsType(mod.name, name, prop, res.parsedDocs, nested.outputs,
 				true /*noflags*/, !prop.out /*wrapInput*/, false /*isInputType*/))
 	}
 	w.Writefmtln("")
@@ -808,71 +749,57 @@ func (g *nodeJSGenerator) emitResourceType(mod *module, res *resourceType) (stri
 	// Emit the state type for get methods.
 	if !res.IsProvider() {
 		w.Writefmtln("")
-		g.emitPlainOldType(w, res.statet, mod.name, name, res.parsedDocs, nestedInputTypes,
+		g.emitPlainOldType(w, res.statet, mod.name, name, res.parsedDocs, nested.inputs,
 			true /*wrapInput*/, true /*isInputType*/)
 	}
 
 	// Emit the argument type for construction.
 	w.Writefmtln("")
-	g.emitPlainOldType(w, res.argst, mod.name, name, res.parsedDocs, nestedInputTypes, true /*wrapInput*/, true /*isInputType*/)
-
-	// Emit nested types.
-	inputFile := ""
-	outputFile := ""
-	if len(nestedInputTypes) > 0 {
-		inputFile, err = g.emitNestedTypes(mod, fldinfos, filename+".ts", nestedInputTypes, true /*isInput*/)
-		if err != nil {
-			return "", "", "", err
-		}
-	}
-	if len(nestedOutputTypes) > 0 {
-		outputFile, err = g.emitNestedTypes(mod, fldinfos, filename+".ts", nestedOutputTypes, false /*isInput*/)
-		if err != nil {
-			return "", "", "", err
-		}
-	}
-
-	return file, inputFile, outputFile, nil
-}
-
-// emitNestedTypes emits the nested type declarations for a module.
-func (g *nodeJSGenerator) emitNestedTypes(mod *module, fldinfos []*tfbridge.SchemaInfo, filename string,
-	nestedTypeDeclarations map[string]string, isInput bool) (string, error) {
-
-	t := "output"
-	if isInput {
-		t = "input"
-	}
-
-	// Ensure the directory exists.
-	typesMod := newModule(filepath.Join("types", t, mod.name))
-	dir := g.moduleDir(typesMod)
-	if err := tools.EnsureDir(dir); err != nil {
-		return "", errors.Wrapf(err, "creating module directory")
-	}
-
-	w, file, err := g.openWriter(typesMod, filename, true)
-	if err != nil {
-		return "", err
-	}
-	defer contract.IgnoreClose(w)
-
-	// Ensure that we've emitted any custom imports pertaining to any of the field types.
-	if err = g.emitCustomImports(w, typesMod, fldinfos); err != nil {
-		return "", err
-	}
-
-	// Write out the nested type declarations.
-	for i, typeName := range stableNestedTypeDeclarations(nestedTypeDeclarations) {
-		if i > 0 {
-			w.Writefmtln("")
-		}
-		declaration := nestedTypeDeclarations[typeName]
-		w.Writefmtln("export interface %s %s", typeName, declaration)
-	}
+	g.emitPlainOldType(w, res.argst, mod.name, name, res.parsedDocs, nested.inputs,
+		true /*wrapInput*/, true /*isInputType*/)
 
 	return file, nil
 }
+
+// TODO JVP DELETE
+// // emitNestedTypes emits the nested type declarations for a module.
+// func (g *nodeJSGenerator) emitNestedTypes(mod *module, fldinfos []*tfbridge.SchemaInfo, filename string,
+// 	nestedTypeDeclarations map[string]string, isInput bool) (string, error) {
+
+// 	t := "output"
+// 	if isInput {
+// 		t = "input"
+// 	}
+
+// 	// Ensure the directory exists.
+// 	typesMod := newModule(filepath.Join("types", t, mod.name))
+// 	dir := g.moduleDir(typesMod)
+// 	if err := tools.EnsureDir(dir); err != nil {
+// 		return "", errors.Wrapf(err, "creating module directory")
+// 	}
+
+// 	w, file, err := g.openWriter(typesMod, filename, true)
+// 	if err != nil {
+// 		return "", err
+// 	}
+// 	defer contract.IgnoreClose(w)
+
+// 	// Ensure that we've emitted any custom imports pertaining to any of the field types.
+// 	if err = g.emitCustomImports(w, typesMod, fldinfos); err != nil {
+// 		return "", err
+// 	}
+
+// 	// Write out the nested type declarations.
+// 	for i, typeName := range stableNestedTypeDeclarations(nestedTypeDeclarations) {
+// 		if i > 0 {
+// 			w.Writefmtln("")
+// 		}
+// 		declaration := nestedTypeDeclarations[typeName]
+// 		w.Writefmtln("export interface %s %s", typeName, declaration)
+// 	}
+
+// 	return file, nil
+// }
 
 func (g *nodeJSGenerator) writeAlias(w *tools.GenWriter, alias tfbridge.AliasInfo) {
 	w.WriteString("{ ")
@@ -898,11 +825,11 @@ func (g *nodeJSGenerator) writeAlias(w *tools.GenWriter, alias tfbridge.AliasInf
 	w.WriteString(" }")
 }
 
-func (g *nodeJSGenerator) emitResourceFunc(mod *module, fun *resourceFunc) (string, string, string, error) {
+func (g *nodeJSGenerator) emitResourceFunc(mod *module, fun *resourceFunc, nested *nestedTypes) (string, error) {
 	// Create a vars.ts file into which all configuration variables will go.
 	w, file, err := g.openWriter(mod, fun.name+".ts", true)
 	if err != nil {
-		return "", "", "", err
+		return "", err
 	}
 	defer contract.IgnoreClose(w)
 
@@ -912,7 +839,7 @@ func (g *nodeJSGenerator) emitResourceFunc(mod *module, fun *resourceFunc) (stri
 		fldinfos = append(fldinfos, fldinfo)
 	}
 	if err = g.emitCustomImports(w, mod, fldinfos); err != nil {
-		return "", "", "", err
+		return "", err
 	}
 
 	// Write the TypeDoc/JSDoc for the data source function.
@@ -970,38 +897,19 @@ func (g *nodeJSGenerator) emitResourceFunc(mod *module, fun *resourceFunc) (stri
 	w.Writefmtln("    return pulumi.utils.liftProperties(promise, opts);")
 	w.Writefmtln("}")
 
-	nestedInputTypes := make(map[string]string)
-	nestedOutputTypes := make(map[string]string)
-
 	// If there are argument and/or return types, emit them.
 	if fun.argst != nil {
 		w.Writefmtln("")
-		g.emitPlainOldType(w, fun.argst, mod.name, strings.Title(fun.name), parsedDoc{}, nestedInputTypes,
+		g.emitPlainOldType(w, fun.argst, mod.name, strings.Title(fun.name), fun.parsedDocs, nested.inputs,
 			false /*wrapInput*/, true /*isInputType*/)
 	}
 	if fun.retst != nil {
 		w.Writefmtln("")
-		g.emitPlainOldType(w, fun.retst, mod.name, strings.Title(fun.name), parsedDoc{}, nestedOutputTypes,
+		g.emitPlainOldType(w, fun.retst, mod.name, strings.Title(fun.name), fun.parsedDocs, nested.outputs,
 			false /*wrapInput*/, false /*isInputType*/)
 	}
 
-	// Emit nested types.
-	inputFile := ""
-	outputFile := ""
-	if len(nestedInputTypes) > 0 {
-		inputFile, err = g.emitNestedTypes(mod, fldinfos, fun.name+".ts", nestedInputTypes, true /*isInput*/)
-		if err != nil {
-			return "", "", "", err
-		}
-	}
-	if len(nestedOutputTypes) > 0 {
-		outputFile, err = g.emitNestedTypes(mod, fldinfos, fun.name+".ts", nestedOutputTypes, false /*isInput*/)
-		if err != nil {
-			return "", "", "", err
-		}
-	}
-
-	return file, inputFile, outputFile, nil
+	return file, nil
 }
 
 // emitOverlay copies an overlay from its source to the target, and returns the resulting file to be exported.
